@@ -1,6 +1,6 @@
 # =============================================================================
 # Feature Toggle Service - Dockerfile (Node.js 22 LTS)
-# Optimized for Render deployment
+# Container deployment (Docker / AKS)
 # Role: Central feature toggle service for the ConFuse platform
 # Includes both backend API and frontend dashboard
 # =============================================================================
@@ -67,7 +67,7 @@ ENV NODE_ENV=production
 
 EXPOSE 3099
 
-# Health check optimized for Render
+# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:${PORT}/health || exit 1
 

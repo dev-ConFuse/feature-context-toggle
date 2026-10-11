@@ -40,7 +40,7 @@ const VERSION = process.env.npm_package_version || '1.0.0';
 // =============================================================================
 // Security Middleware
 // =============================================================================
-// @ts-ignore - Vercel TS compilation workaround for helmet types
+// @ts-ignore - helmet type mismatch workaround
 app.use(helmet());
 
 // =============================================================================
