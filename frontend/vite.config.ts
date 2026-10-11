@@ -3,14 +3,23 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig(({ mode }) => {
     const env = loadEnv(mode, process.cwd(), '')
-    
+
+    // Env-only configuration (see .cline/rules/env-policy.md) — fail fast
+    const requireEnv = (name: string): string => {
+        const value = env[name]
+        if (!value) {
+            throw new Error(`Missing required environment variable: ${name}`)
+        }
+        return value
+    }
+
     return {
         plugins: [react()],
         server: {
-            port: parseInt(env.VITE_PORT || '5173'),
+            port: parseInt(requireEnv('VITE_PORT'), 10),
             proxy: {
                 '/api': {
-                    target: env.VITE_BACKEND_URL || 'http://127.0.0.1:3099',
+                    target: requireEnv('VITE_BACKEND_URL'),
                     changeOrigin: true,
                 },
             },

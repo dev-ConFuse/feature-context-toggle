@@ -63,13 +63,13 @@ USER nextjs
 # =============================================================================
 
 ENV NODE_ENV=production
-ENV PORT=3099
+# PORT is supplied at runtime via .map.env / .secret.env (see .cline/rules/env-policy.md)
 
 EXPOSE 3099
 
 # Health check optimized for Render
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:${PORT:-3099}/health || exit 1
+    CMD curl -f http://localhost:${PORT}/health || exit 1
 
 # Use dumb-init as PID 1 for proper signal handling
 ENTRYPOINT ["dumb-init", "--"]
