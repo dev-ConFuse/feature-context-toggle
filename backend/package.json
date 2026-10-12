@@ -1,7 +1,7 @@
 {
   "name": "feature-toggle-backend",
   "version": "1.0.0",
-  "description": "Backend API for feature toggle management with PostgreSQL and Redis",
+  "description": "Backend API for feature toggle management with PostgreSQL",
   "main": "dist/index.js",
   "type": "module",
   "scripts": {

@@ -59,7 +59,6 @@ npm run dev
 | `PORT` | Backend server port | `3099` |
 | `DB_HOST` / `DB_PORT` / `DB_NAME` / `DB_USER` / `DB_PASSWORD` | PostgreSQL | Required |
 | `DB_SCHEMA` | Database schema | `feature_toggles` |
-| `REDIS_URL` | Redis connection URL | Required |
 | `FRONTEND_PORT` | Dashboard port (dev) | `5173` |
 
 ## Integration with auth-middleware

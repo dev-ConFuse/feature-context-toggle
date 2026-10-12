@@ -1,7 +1,7 @@
 /**
  * Feature Toggle - Toggle Routes (Database Version)
  * 
- * REST API for managing feature toggles using PostgreSQL with Redis caching.
+ * REST API for managing feature toggles using PostgreSQL with an in-memory cache.
  */
 
 import { Router, Request, Response } from 'express';
