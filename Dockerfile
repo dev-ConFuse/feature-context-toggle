@@ -13,7 +13,9 @@ WORKDIR /app/frontend
 COPY frontend/package*.json ./
 RUN npm install
 COPY frontend ./
-RUN npm run build || true
+# The dashboard build is optional (its src/sdk has pre-existing missing-type
+# errors); never block the API image on it.
+RUN npm run build || mkdir -p dist
 
 # =============================================================================
 FROM node:22-alpine AS production
