@@ -149,9 +149,33 @@ app.use((req, res) => {
 // =============================================================================
 // Error Handler
 // =============================================================================
-app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+app.use((err: Error & { type?: string; status?: number }, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    // Classify client-body errors instead of masking them as internal faults
+    // (same contract as the auth-middleware error handler).
+    if (err.type === 'entity.parse.failed') {
+        return res.status(400).json({
+            success: false,
+            error: 'Invalid JSON body',
+            timestamp: new Date().toISOString(),
+        });
+    }
+    if (err.type === 'entity.too.large') {
+        return res.status(413).json({
+            success: false,
+            error: 'Payload too large',
+            timestamp: new Date().toISOString(),
+        });
+    }
+    if (err.type === 'encoding.unsupported') {
+        return res.status(415).json({
+            success: false,
+            error: 'Unsupported encoding',
+            timestamp: new Date().toISOString(),
+        });
+    }
+    const status = err.status && err.status >= 400 && err.status < 500 ? err.status : 500;
     logger.error('Unhandled error:', err);
-    res.status(500).json({
+    res.status(status).json({
         success: false,
         error: process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message,
         timestamp: new Date().toISOString(),
