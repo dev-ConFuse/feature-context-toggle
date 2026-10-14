@@ -9,6 +9,7 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import path from 'path';
+import { randomUUID } from 'crypto';
 import { fileURLToPath } from 'url';
 import { loadConfig, getConfig } from './config.js';
 import { getDb } from './db/client.js';
@@ -68,8 +69,62 @@ app.use(cors({
 app.use(express.json());
 
 // =============================================================================
-// Request Logging
+// Request Logging (uniform ConFuse observability contract: correlation IDs +
+// one access record per request with outcome classification — success /
+// redirect / client_error / server_error — so failures and redirects are as
+// visible as successes; query values are redacted before logging)
 // =============================================================================
+const SENSITIVE_QUERY_KEYS = ['token', 'key', 'secret', 'password', 'auth'];
+
+/** Redact secret-looking query values so access logs never leak credentials. */
+function sanitizeQuery(query: string): string {
+    return query
+        .split('&')
+        .map((pair) => {
+            const key = pair.split('=')[0];
+            return SENSITIVE_QUERY_KEYS.some((needle) => key.toLowerCase().includes(needle))
+                ? `${key}=[redacted]`
+                : pair;
+        })
+        .join('&');
+}
+
+app.use((req, res, next) => {
+    const correlationId = (req.headers['x-correlation-id'] as string) || randomUUID();
+    res.setHeader('X-Correlation-Id', correlationId);
+    const start = Date.now();
+    const query = req.originalUrl.includes('?')
+        ? sanitizeQuery(req.originalUrl.slice(req.originalUrl.indexOf('?') + 1))
+        : '';
+    logger.debug('[REQUEST] started', {
+        correlationId,
+        method: req.method,
+        path: req.path,
+        query,
+        ip: req.ip,
+        userAgent: req.headers['user-agent'],
+    });
+    res.on('finish', () => {
+        const durationMs = Date.now() - start;
+        const status = res.statusCode;
+        const base = { correlationId, method: req.method, path: req.path, query, status, durationMs, ip: req.ip };
+        if (status < 300) {
+            logger.http(`[RESPONSE] ${req.method} ${req.path} ${status} ${durationMs}ms`, { ...base, outcome: 'success' });
+        } else if (status < 400) {
+            logger.warn(`[REDIRECT] ${req.method} ${req.path} ${status} ${durationMs}ms`, {
+                ...base,
+                outcome: 'redirect',
+                location: res.getHeader('location'),
+            });
+        } else if (status < 500) {
+            logger.warn(`[CLIENT_ERROR] ${req.method} ${req.path} ${status} ${durationMs}ms`, { ...base, outcome: 'client_error' });
+        } else {
+            logger.error(`[SERVER_ERROR] ${req.method} ${req.path} ${status} ${durationMs}ms`, { ...base, outcome: 'server_error' });
+        }
+    });
+    next();
+});
+
 // Health Check
 // =============================================================================
 app.get('/health', async (_req, res) => {

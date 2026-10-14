@@ -5,6 +5,7 @@
  */
 
 import { getConfig } from './config.js';
+import { logger } from './utils/logger.js';
 
 // =============================================================================
 // Types
@@ -135,7 +136,7 @@ export function validateCategory(category: string): ValidationResult {
     // Allow custom categories, but warn if not in standard list
     if (!VALID_CATEGORIES.includes(category as typeof VALID_CATEGORIES[number])) {
         // This is a warning, not an error - allow custom categories
-        console.log(`Note: Using custom category '${category}'. Standard categories are: ${VALID_CATEGORIES.join(', ')}`);
+        logger.info(`Note: Using custom category '${category}'. Standard categories are: ${VALID_CATEGORIES.join(', ')}`);
     }
 
     return { valid: errors.length === 0, errors };

@@ -9,6 +9,7 @@ import { Pool, PoolClient } from 'pg';
 import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
+import { logger } from '../utils/logger.js';
 import { getConfig, type Config } from '../config.js';
 
 // ESM __dirname equivalent
@@ -119,7 +120,7 @@ export class DatabaseManager {
 
     // Log pool errors
     this.pool.on('error', (err) => {
-      console.error('[DATABASE] [ERROR] Unexpected database pool error:', err);
+      logger.error('[DATABASE] [ERROR] Unexpected database pool error:', err);
     });
 
 
@@ -151,7 +152,7 @@ export class DatabaseManager {
         await this.pool.query(schema);
 
       } else {
-        console.warn('[DATABASE] ⚠️ Schema file not found at:', schemaPath);
+        logger.warn('[DATABASE] ⚠️ Schema file not found at:', schemaPath);
 
         await this.createMinimalSchema();
 
@@ -161,8 +162,8 @@ export class DatabaseManager {
 
       return true;
     } catch (error) {
-      console.error('[DATABASE] ❌ Failed to initialize database:', error);
-      console.error('[DATABASE] Error details:', error instanceof Error ? error.message : 'Unknown error');
+      logger.error('[DATABASE] ❌ Failed to initialize database:', error);
+      logger.error('[DATABASE] Error details:', error instanceof Error ? error.message : 'Unknown error');
       return false;
     }
   }
@@ -219,7 +220,7 @@ export class DatabaseManager {
       };
     } catch (error) {
       const latency = Date.now() - start;
-      console.error(`[DATABASE] [HEALTH] Health check failed, latency: ${latency}ms`, error);
+      logger.error(`[DATABASE] [HEALTH] Health check failed, latency: ${latency}ms`, error);
       return {
         healthy: false,
         latencyMs: latency,
@@ -322,7 +323,7 @@ export class DatabaseManager {
       return toggle;
     } catch (error) {
       await client.query('ROLLBACK');
-      console.error(`[DATABASE] [CREATE] Failed to create toggle '${input.name}':`, error);
+      logger.error(`[DATABASE] [CREATE] Failed to create toggle '${input.name}':`, error);
       throw error;
     } finally {
       client.release();
@@ -383,7 +384,7 @@ export class DatabaseManager {
       return toggle;
     } catch (error) {
       await client.query('ROLLBACK');
-      console.error(`[DATABASE] [UPDATE] Failed to update toggle '${name}':`, error);
+      logger.error(`[DATABASE] [UPDATE] Failed to update toggle '${name}':`, error);
       throw error;
     } finally {
       client.release();
@@ -480,7 +481,7 @@ export class DatabaseManager {
       return true;
     } catch (error) {
       await client.query('ROLLBACK');
-      console.error(`[DATABASE] [DELETE] Failed to delete toggle '${name}':`, error);
+      logger.error(`[DATABASE] [DELETE] Failed to delete toggle '${name}':`, error);
       throw error;
     } finally {
       client.release();

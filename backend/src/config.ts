@@ -5,6 +5,8 @@
  * All configuration values are loaded from environment variables.
  */
 
+import { logger } from './utils/logger.js';
+
 // =============================================================================
 // Configuration Interface
 // =============================================================================
@@ -125,7 +127,7 @@ export function loadConfig(): Config {
                     ssl = true;
                 }
             } catch (e) {
-                console.error('Failed to parse DATABASE_URL from environment:', e);
+                logger.error('Failed to parse DATABASE_URL from environment:', e);
                 throw new Error('Invalid DATABASE_URL format');
             }
 
