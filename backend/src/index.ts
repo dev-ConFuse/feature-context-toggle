@@ -97,19 +97,28 @@ app.use((req, res, next) => {
         ? sanitizeQuery(req.originalUrl.slice(req.originalUrl.indexOf('?') + 1))
         : '';
     logger.debug('[REQUEST] started', {
-        correlationId,
+        correlation_id: correlationId,
         method: req.method,
         path: req.path,
         query,
-        ip: req.ip,
-        userAgent: req.headers['user-agent'],
+        client: req.ip,
+        user_agent: req.headers['user-agent'],
     });
     res.on('finish', () => {
         const durationMs = Date.now() - start;
         const status = res.statusCode;
-        const base = { correlationId, method: req.method, path: req.path, query, status, durationMs, ip: req.ip };
+        const base = {
+            correlation_id: correlationId,
+            method: req.method,
+            path: req.path,
+            query,
+            status,
+            duration_ms: durationMs,
+            client: req.ip,
+            user_agent: req.headers['user-agent'],
+        };
         if (status < 300) {
-            logger.http(`[RESPONSE] ${req.method} ${req.path} ${status} ${durationMs}ms`, { ...base, outcome: 'success' });
+            logger.info(`[RESPONSE] ${req.method} ${req.path} ${status} ${durationMs}ms`, { ...base, outcome: 'success' });
         } else if (status < 400) {
             logger.warn(`[REDIRECT] ${req.method} ${req.path} ${status} ${durationMs}ms`, {
                 ...base,
