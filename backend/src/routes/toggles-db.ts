@@ -5,7 +5,7 @@
  */
 
 import { Router, Request, Response } from 'express';
-import { getDb, Toggle } from '../db/client.js';
+import { getDb, isTransientDbError, Toggle } from '../db/client.js';
 import { cache } from '../cache.js';
 import { getConfig } from '../config.js';
 import { logger } from '../utils/logger.js';
@@ -28,6 +28,28 @@ const router = Router();
 // =============================================================================
 // Helper Functions
 // =============================================================================
+
+/**
+ * Map a DB-layer failure to an API response: transient connectivity faults
+ * become 503 (clients retry) with a clean message — driver internals never
+ * reach clients, same contract as auth-middleware's error handling.
+ */
+function respondDbError(res: Response, error: unknown, fallback: string): void {
+    if (isTransientDbError(error)) {
+        res.status(503).json({
+            success: false,
+            error: 'Service temporarily unavailable',
+            message: 'Could not reach the toggle database. Please retry.',
+            timestamp: new Date().toISOString(),
+        } as ApiResponse);
+        return;
+    }
+    res.status(500).json({
+        success: false,
+        error: fallback,
+        timestamp: new Date().toISOString(),
+    } as ApiResponse);
+}
 
 /**
  * Get client identifier for audit logging
@@ -121,11 +143,7 @@ router.get('/', async (req: Request, res: Response) => {
         });
     } catch (error) {
         logger.error('[ROUTE] [ERROR] GET /api/toggles - Error fetching toggles:', error);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to fetch toggles',
-            timestamp: new Date().toISOString(),
-        } as ApiResponse);
+        respondDbError(res, error, 'Failed to fetch toggles');
     }
 });
 
@@ -147,11 +165,7 @@ router.get('/categories', async (_req: Request, res: Response) => {
         } as ApiResponse);
     } catch (error) {
         logger.error('[ROUTE] [ERROR] GET /api/toggles/categories - Error:', error);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to fetch categories',
-            timestamp: new Date().toISOString(),
-        } as ApiResponse);
+        respondDbError(res, error, 'Failed to fetch categories');
     }
 });
 
@@ -172,11 +186,7 @@ router.get('/audit', async (req: Request, res: Response) => {
         } as ApiResponse<AuditEntry[]>);
     } catch (error) {
         logger.error('[ROUTE] [ERROR] GET /api/toggles/audit - Error:', error);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to fetch audit log',
-            timestamp: new Date().toISOString(),
-        } as ApiResponse);
+        respondDbError(res, error, 'Failed to fetch audit log');
     }
 });
 
@@ -230,11 +240,7 @@ router.get('/:name', async (req: Request, res: Response) => {
         });
     } catch (error) {
         logger.error(`[ROUTE] [ERROR] GET /api/toggles/${name} - Error:`, error);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to fetch toggle',
-            timestamp: new Date().toISOString(),
-        } as ApiResponse);
+        respondDbError(res, error, 'Failed to fetch toggle');
     }
 });
 
@@ -291,11 +297,7 @@ router.get('/:name/history', async (req: Request, res: Response) => {
         } as ApiResponse<AuditEntry[]>);
     } catch (error) {
         logger.error('Error fetching toggle history:', error);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to fetch toggle history',
-            timestamp: new Date().toISOString(),
-        } as ApiResponse);
+        respondDbError(res, error, 'Failed to fetch toggle history');
     }
 });
 
@@ -346,11 +348,7 @@ router.post('/', async (req: Request, res: Response) => {
         } as ApiResponse);
     } catch (error) {
         logger.error('[ROUTE] [ERROR] POST /api/toggles - Error creating toggle:', error);
-        res.status(500).json({
-            success: false,
-            error: error instanceof Error ? error.message : 'Failed to create toggle',
-            timestamp: new Date().toISOString(),
-        } as ApiResponse);
+        respondDbError(res, error, 'Failed to create toggle');
     }
 });
 
@@ -390,11 +388,7 @@ router.post('/bulk', async (req: Request, res: Response) => {
         } as ApiResponse);
     } catch (error) {
         logger.error('[ROUTE] [ERROR] POST /api/toggles/bulk - Error:', error);
-        res.status(500).json({
-            success: false,
-            error: error instanceof Error ? error.message : 'Failed to bulk update toggles',
-            timestamp: new Date().toISOString(),
-        } as ApiResponse);
+        respondDbError(res, error, 'Failed to bulk update toggles');
     }
 });
 
@@ -441,11 +435,7 @@ router.patch('/:name', async (req: Request, res: Response) => {
         } as ApiResponse);
     } catch (error) {
         logger.error(`[ROUTE] [ERROR] PATCH /api/toggles/${name} - Error:`, error);
-        res.status(500).json({
-            success: false,
-            error: error instanceof Error ? error.message : 'Failed to update toggle',
-            timestamp: new Date().toISOString(),
-        } as ApiResponse);
+        respondDbError(res, error, 'Failed to update toggle');
     }
 });
 
@@ -492,11 +482,7 @@ router.patch('/:name/metadata', async (req: Request, res: Response) => {
         } as ApiResponse);
     } catch (error) {
         logger.error(`[ROUTE] [ERROR] PATCH /api/toggles/${name}/metadata - Error:`, error);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to update toggle metadata',
-            timestamp: new Date().toISOString(),
-        } as ApiResponse);
+        respondDbError(res, error, 'Failed to update toggle metadata');
     }
 });
 
@@ -530,11 +516,7 @@ router.delete('/:name', async (req: Request, res: Response) => {
         } as ApiResponse);
     } catch (error) {
         logger.error(`[ROUTE] [ERROR] DELETE /api/toggles/${name} - Error:`, error);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to delete toggle',
-            timestamp: new Date().toISOString(),
-        } as ApiResponse);
+        respondDbError(res, error, 'Failed to delete toggle');
     }
 });
 

@@ -26,6 +26,22 @@ export interface Config {
         password?: string;
         schema: string;
         ssl: boolean;
+        /** pg connect timeout in ms — sized to the slow runtime→Neon handshake. */
+        connectionTimeoutMs: number;
+        /** Upper bound in ms for the /health DB probe (liveness stays fast). */
+        healthTimeoutMs: number;
+        /** Warm connections kept open across idle gaps (avoid cold connects). */
+        poolMin: number;
+        poolMax: number;
+        /** Idle connections above `poolMin` are reaped after this long. */
+        poolIdleTimeoutMs: number;
+        /** TCP keepalive probe delay — defeats idle NAT/flow expiry on the path. */
+        keepAliveDelayMs: number;
+        /** Client-side abort for in-flight queries (dead-connection hangs). */
+        queryTimeoutMs: number;
+        /** Transient-failure retries for DB operations (see db/client.ts). */
+        retryAttempts: number;
+        retryDelayMs: number;
     };
 
     // Cache
@@ -139,6 +155,15 @@ export function loadConfig(): Config {
                 password,
                 schema: getRequired('DB_SCHEMA'),
                 ssl,
+                connectionTimeoutMs: getInt('DB_CONNECT_TIMEOUT_MS'),
+                healthTimeoutMs: getInt('DB_HEALTH_TIMEOUT_MS'),
+                poolMin: getInt('DB_POOL_MIN'),
+                poolMax: getInt('DB_POOL_MAX'),
+                poolIdleTimeoutMs: getInt('DB_POOL_IDLE_TIMEOUT_MS'),
+                keepAliveDelayMs: getInt('DB_KEEPALIVE_DELAY_MS'),
+                queryTimeoutMs: getInt('DB_QUERY_TIMEOUT_MS'),
+                retryAttempts: getInt('DB_RETRY_ATTEMPTS'),
+                retryDelayMs: getInt('DB_RETRY_DELAY_MS'),
             };
         })(),
 
