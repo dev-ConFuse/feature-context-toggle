@@ -157,6 +157,9 @@ app.get('/health', async (_req, res) => {
     };
 
     logger.debug(`[HEALTH] Responding with status: ${status}`);
+    // Liveness contract: 200 as long as no *confirmed* dependency failure —
+    // a slow connect is reported in dependencies (status: 'timeout') but never
+    // flips the endpoint, so probes stay fast and non-flappy.
     res.status(isHealthy ? 200 : 503).json(response);
 });
 
@@ -239,9 +242,12 @@ app.use((err: Error & { type?: string; status?: number }, _req: express.Request,
     }
     const status = err.status && err.status >= 400 && err.status < 500 ? err.status : 500;
     logger.error('Unhandled error:', err);
+    // Never echo err.message: driver internals must not reach clients, and
+    // NODE_ENV may be 'development' in local runs (same contract as
+    // auth-middleware's error handler).
     res.status(status).json({
         success: false,
-        error: process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message,
+        error: status >= 500 ? 'Internal server error' : err.message,
         timestamp: new Date().toISOString(),
     });
 });
@@ -262,27 +268,32 @@ async function start() {
     logger.info('╚══════════════════════════════════════════════════════════╝');
     logger.info('');
 
+    // Start listening first — liveness must not wait on the slow runtime→Neon
+    // handshake. Schema/cache init runs in the background; /health reports the
+    // dependency state while it converges (DB schema init is idempotent
+    // `CREATE TABLE IF NOT EXISTS`, so early requests are safe).
+    app.listen(PORT, () => {
+        logger.info(`🚀 Server running on http://localhost:${PORT}`);
+    });
+
     // Initialize database
     logger.info('[STARTUP] Initializing database connection...');
-    const dbReady = await getDb().initialize();
-    if (!dbReady) {
-        logger.warn('[STARTUP] ⚠️  Database initialization failed, running in degraded mode');
-    } else {
-        logger.info('[STARTUP] ✅ Database initialized successfully');
-    }
+    void getDb().initialize().then((dbReady) => {
+        if (!dbReady) {
+            logger.warn('[STARTUP] ⚠️  Database initialization failed, running in degraded mode');
+        } else {
+            logger.info('[STARTUP] ✅ Database initialized successfully');
+        }
+    });
 
     // Initialize cache
     logger.info('[STARTUP] Initializing cache...');
-    const cacheReady = await cache.initialize();
-    if (!cacheReady) {
-        logger.warn('[STARTUP] ⚠️  Cache not available, running without caching');
-    } else {
-        logger.info('[STARTUP] ✅ Cache initialized successfully');
-    }
-
-    // Start server
-    app.listen(PORT, () => {
-        logger.info(`🚀 Server running on http://localhost:${PORT}`);
+    void cache.initialize().then((cacheReady) => {
+        if (!cacheReady) {
+            logger.warn('[STARTUP] ⚠️  Cache not available, running without caching');
+        } else {
+            logger.info('[STARTUP] ✅ Cache initialized successfully');
+        }
     });
 }
 

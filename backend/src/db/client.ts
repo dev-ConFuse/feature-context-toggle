@@ -5,12 +5,23 @@
  * and audit logging support.
  */
 
-import { Pool, PoolClient } from 'pg';
+import { Pool, PoolClient, QueryResult } from 'pg';
 import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
+import { setDefaultResultOrder } from 'dns';
+import { setDefaultAutoSelectFamily } from 'net';
 import { logger } from '../utils/logger.js';
 import { getConfig, type Config } from '../config.js';
+
+// Process-wide socket behaviour, set before any connection is opened.
+// WHY: Node's happy-eyeballs abandons each connect attempt after its short
+// per-attempt timeout, but the runtime's path to Neon needs seconds per TCP
+// handshake — every attempt died with a bare ETIMEDOUT (empty message) even
+// though a plain IPv4 connect succeeds. Prefer IPv4 and let a single attempt
+// run to the configured connection timeout.
+setDefaultResultOrder('ipv4first');
+setDefaultAutoSelectFamily(false);
 
 // ESM __dirname equivalent
 const __filename = fileURLToPath(import.meta.url);
@@ -66,6 +77,83 @@ interface DatabaseConfig {
   user: string;
   password?: string;
   schema: string;
+  connectionTimeoutMs: number;
+  healthTimeoutMs: number;
+  poolMin: number;
+  poolMax: number;
+  poolIdleTimeoutMs: number;
+  keepAliveDelayMs: number;
+  queryTimeoutMs: number;
+  retryAttempts: number;
+  retryDelayMs: number;
+}
+
+/**
+ * Result of the bounded database liveness probe (GET /health).
+ *
+ * `healthy` means "no confirmed failure": a probe still in flight is *not* a
+ * failure (slow connects are the norm on this runtime) — `status` refines the
+ * picture: `connected` / `disconnected` are resolved outcomes, `timeout` means
+ * the probe has not resolved yet. `latencyMs` is how long the health check
+ * itself waited (bounded by DB_HEALTH_TIMEOUT_MS), never the raw connect time.
+ */
+export interface DbHealth {
+  healthy: boolean;
+  latencyMs: number;
+  status: 'connected' | 'disconnected' | 'timeout';
+  error?: string;
+}
+
+/** Probe outcome without the call-scoped latency (the cached form). */
+type DbHealthOutcome = Omit<DbHealth, 'latencyMs'>;
+
+// Socket/transport codes the pg driver surfaces on connection faults.
+const TRANSIENT_SOCKET_CODES =
+  /^(ETIMEDOUT|ECONNRESET|ECONNREFUSED|ECONNABORTED|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN|EPIPE|EPROTO|ENOTFOUND|UND_ERR_[A-Z_]+)$/i;
+const TRANSIENT_DB_MESSAGE =
+  /connection (refused|reset|terminated)|timeout exceeded when trying to connect|connection timeout|query read timeout|timed out|database is not reachable|econnrefused|etimedout|econnreset|eai_again|fetch failed/i;
+
+/**
+ * True when the failure is DB connectivity (transient), not a query error.
+ * Used to answer 503 (retryable) instead of a misleading 500.
+ */
+export function isTransientDbError(error: unknown): boolean {
+  let current: unknown = error;
+  // Walk a short cause chain: the driver wraps the socket error one level down.
+  for (let depth = 0; current && typeof current === 'object' && depth < 4; depth++) {
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === 'string' && TRANSIENT_SOCKET_CODES.test(code)) {
+      return true;
+    }
+    const message = current instanceof Error
+      ? current.message
+      : String((current as { message?: unknown }).message ?? '');
+    if (TRANSIENT_DB_MESSAGE.test(message)) {
+      return true;
+    }
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/**
+ * True when the error (or one of its causes) is Postgres unique_violation.
+ * A retried write can surface this way when the first attempt actually
+ * committed but its response was lost — see createToggle.
+ */
+function isUniqueViolation(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; current && typeof current === 'object' && depth < 4; depth++) {
+    if ((current as { code?: unknown }).code === '23505') {
+      return true;
+    }
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // =============================================================================
@@ -77,6 +165,10 @@ export class DatabaseManager {
   private config: DatabaseConfig;
   private initialized: boolean = false;
   private isProduction: boolean;
+  /** Last resolved health-probe outcome (see healthCheck). */
+  private lastHealth: DbHealthOutcome | null = null;
+  /** Shared in-flight probe — health polling must not stampede the pool. */
+  private inFlightProbe: Promise<DbHealthOutcome> | null = null;
 
   constructor() {
 
@@ -90,6 +182,15 @@ export class DatabaseManager {
       user: appConfig.db.user,
       password: appConfig.db.password,
       schema: appConfig.db.schema,
+      connectionTimeoutMs: appConfig.db.connectionTimeoutMs,
+      healthTimeoutMs: appConfig.db.healthTimeoutMs,
+      poolMin: appConfig.db.poolMin,
+      poolMax: appConfig.db.poolMax,
+      poolIdleTimeoutMs: appConfig.db.poolIdleTimeoutMs,
+      keepAliveDelayMs: appConfig.db.keepAliveDelayMs,
+      queryTimeoutMs: appConfig.db.queryTimeoutMs,
+      retryAttempts: appConfig.db.retryAttempts,
+      retryDelayMs: appConfig.db.retryDelayMs,
     };
 
     this.isProduction = appConfig.isProduction;
@@ -108,11 +209,33 @@ export class DatabaseManager {
       database: this.config.database,
       user: this.config.user,
       password: this.config.password,
-      max: 20,
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 10000,
+      // Warm pool: keep >=1 connection open across idle gaps so requests do not
+      // pay the 3-21 s container→Neon handshake again after every quiet spell.
+      // TCP keepalive probes defeat idle NAT/flow expiry that silently kills
+      // parked connections on this path.
+      min: this.config.poolMin,
+      max: this.config.poolMax,
+      idleTimeoutMillis: this.config.poolIdleTimeoutMs,
+      keepAlive: true,
+      keepAliveInitialDelayMillis: this.config.keepAliveDelayMs,
+      // Slow runtime→Neon handshakes need headroom (env-tuned, see config.ts)
+      connectionTimeoutMillis: this.config.connectionTimeoutMs,
+      // Query budget: server-side statement_timeout cancels stuck work cleanly;
+      // query_timeout is the client-side backstop for silently-dead connections
+      // where no server response will ever arrive.
+      statement_timeout: this.config.queryTimeoutMs,
+      query_timeout: this.config.queryTimeoutMs,
       ssl: sslConfig,
     });
+
+      // Idle/dead pooled clients emit 'error' asynchronously. Without a
+      // listener Node treats that as an uncaught exception and the whole
+      // process dies mid-request (seen by callers as "Server disconnected
+      // without sending a response"). Log it and let pg replace the client -
+      // a dead idle connection is never a process-level failure.
+      this.pool.on('error', (err: Error) => {
+        logger.warn('[DATABASE] idle pool client error (pool will replace it)', err);
+      });
 
 
 
@@ -129,6 +252,56 @@ export class DatabaseManager {
   // =========================================================================
   // Initialization
   // =========================================================================
+
+  /**
+   * Retry a DB operation on transient connectivity failures (attempts/delay are
+   * env-tuned per .cline/rules/env-policy.md) so a dropped connection does not
+   * surface as a request failure — the same pattern as auth-middleware's
+   * withDbRetry. Non-transient errors (e.g. constraint violations) rethrow at
+   * once.
+   */
+  private async withRetry<T>(operation: () => Promise<T>): Promise<T> {
+    const maxAttempts = Math.max(1, this.config.retryAttempts);
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await operation();
+      } catch (error) {
+        lastError = error;
+        if (!isTransientDbError(error) || attempt === maxAttempts) {
+          throw error;
+        }
+        logger.warn(`[DATABASE] transient failure, retrying (${attempt}/${maxAttempts})`, error);
+        await sleep(this.config.retryDelayMs * attempt);
+      }
+    }
+    throw lastError;
+  }
+
+
+
+  /**
+   * Check out a pooled client with an inert 'error' sink attached.
+   *
+   * pg-pool detaches its own error forwarding the moment a client is handed
+   * out, so a socket that dies mid-transaction emits 'error' on the Client
+   * with no listener - Node treats that as an uncaught exception and the
+   * whole process exits mid-request (callers see "Server disconnected
+   * without sending a response"). The query promise still rejects, so every
+   * existing try/catch keeps working unchanged.
+   */
+  private async connectClient(): Promise<PoolClient> {
+    const client = await this.pool.connect();
+    client.on('error', (err: Error) => {
+      logger.warn('[DATABASE] checked-out client socket error (query will reject)', err);
+    });
+    return client;
+  }
+
+  /** Single query with transient-failure retry. */
+  private query(text: string, params?: unknown[]): Promise<QueryResult> {
+    return this.withRetry(() => this.pool.query(text, params));
+  }
 
   /**
    * Initialize the database schema and tables
@@ -149,7 +322,7 @@ export class DatabaseManager {
 
         const schema = fs.readFileSync(schemaPath, 'utf-8');
 
-        await this.pool.query(schema);
+        await this.query(schema);
 
       } else {
         logger.warn('[DATABASE] ⚠️ Schema file not found at:', schemaPath);
@@ -205,27 +378,66 @@ export class DatabaseManager {
   }
 
   /**
-   * Health check - verify database connectivity
+   * Health check - bounded database probe for GET /health.
+   *
+   * Liveness must answer even while the pool is still establishing a (slow)
+   * runtime→Neon connect, so `SELECT 1` is raced against DB_HEALTH_TIMEOUT_MS
+   * and the resolved outcome is cached. While a fresh query is still in flight
+   * the cached status is reported; a late driver rejection can never become an
+   * unhandled rejection because the probe is pre-settled. `status: 'timeout'`
+   * means "probe still in flight, no outcome known yet" and is not a failure.
    */
-  async healthCheck(): Promise<{ healthy: boolean; latencyMs: number; error?: string }> {
-
+  async healthCheck(): Promise<DbHealth> {
     const start = Date.now();
-    try {
-      await this.pool.query('SELECT 1');
-      const latency = Date.now() - start;
+    if (!this.inFlightProbe) {
+      // Deduplicated probe: concurrent health calls share one `SELECT 1`
+      // instead of stacking connects on a cold pool.
+      this.inFlightProbe = this.pool.query('SELECT 1').then(
+        () => ({
+          healthy: true,
+          status: 'connected' as const,
+        }),
+        (error: unknown) => {
+          const message = error instanceof Error ? error.message : 'Unknown error';
+          if (isTransientDbError(error)) {
+            // Connection-level refusals/timeouts are *inconclusive* on this
+            // runtime: the container→Neon egress produces them for perfectly
+            // healthy databases (connects legitimately exceed the probe budget).
+            // Report "unknown", not "down", so liveness never flaps.
+            return { healthy: true, status: 'timeout' as const, error: message };
+          }
+          return { healthy: false, status: 'disconnected' as const, error: message };
+        },
+      ).then((result) => {
+        this.lastHealth = result;
+        return result;
+      }).finally(() => {
+        this.inFlightProbe = null;
+      });
+    }
+    const probe = this.inFlightProbe;
 
-      return {
-        healthy: true,
-        latencyMs: latency,
-      };
-    } catch (error) {
-      const latency = Date.now() - start;
-      logger.error(`[DATABASE] [HEALTH] Health check failed, latency: ${latency}ms`, error);
-      return {
-        healthy: false,
-        latencyMs: latency,
-        error: error instanceof Error ? error.message : 'Unknown error',
-      };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const bound = new Promise<DbHealthOutcome>((resolve) => {
+      timer = setTimeout(
+        // No resolved outcome yet is *not* evidence of failure: a slow connect
+        // is the norm on this runtime, so an unknown state reports healthy and
+        // the payload's `status: 'timeout'` tells consumers the probe is pending.
+        () => resolve(this.lastHealth ?? {
+          healthy: true,
+          status: 'timeout' as const,
+        }),
+        this.config.healthTimeoutMs,
+      );
+    });
+
+    try {
+      const outcome = await Promise.race([probe, bound]);
+      return { ...outcome, latencyMs: Date.now() - start };
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
     }
   }
 
@@ -238,7 +450,7 @@ export class DatabaseManager {
    */
   async getToggle(name: string): Promise<Toggle | null> {
 
-    const result = await this.pool.query(
+    const result = await this.query(
       `SELECT * FROM ${this.config.schema}.toggles WHERE name = $1`,
       [name]
     );
@@ -277,17 +489,37 @@ export class DatabaseManager {
 
     query += ' ORDER BY category, name';
 
-    const result = await this.pool.query(query, params);
+    const result = await this.query(query, params);
 
     return result.rows;
   }
 
   /**
-   * Create a new toggle
+   * Create a new toggle (whole transaction retried on transient DB failures).
+   *
+   * Idempotent under retry: if the first attempt committed but its response
+   * was lost (client-side query timeout while COMMIT finished server-side),
+   * the retry hits the unique constraint. The row exists at that point, so
+   * return it instead of surfacing a 500 for a successful write.
    */
   async createToggle(input: CreateToggleInput, changedBy: string = 'system'): Promise<Toggle> {
+    try {
+      return await this.withRetry(() => this.createToggleOnce(input, changedBy));
+    } catch (error) {
+      if (isUniqueViolation(error)) {
+        const existing = await this.getToggle(input.name);
+        if (existing) {
+          logger.warn(`[DATABASE] [CREATE] retried create hit unique constraint; returning existing '${input.name}'`);
+          return existing;
+        }
+      }
+      throw error;
+    }
+  }
 
-    const client = await this.pool.connect();
+  private async createToggleOnce(input: CreateToggleInput, changedBy: string): Promise<Toggle> {
+
+    const client = await this.connectClient();
 
     try {
       await client.query('BEGIN');
@@ -322,7 +554,9 @@ export class DatabaseManager {
 
       return toggle;
     } catch (error) {
-      await client.query('ROLLBACK');
+      // Best-effort rollback: on a dead connection ROLLBACK itself throws and
+      // would mask the original error the caller needs to classify.
+      await client.query('ROLLBACK').catch(() => undefined);
       logger.error(`[DATABASE] [CREATE] Failed to create toggle '${input.name}':`, error);
       throw error;
     } finally {
@@ -331,7 +565,7 @@ export class DatabaseManager {
   }
 
   /**
-   * Update a toggle's enabled state
+   * Update a toggle's enabled state (whole transaction retried on transient failures).
    */
   async updateToggle(
     name: string,
@@ -339,7 +573,16 @@ export class DatabaseManager {
     changedBy: string = 'system',
     notes?: string
   ): Promise<Toggle | null> {
-    const client = await this.pool.connect();
+    return this.withRetry(() => this.updateToggleOnce(name, enabled, changedBy, notes));
+  }
+
+  private async updateToggleOnce(
+    name: string,
+    enabled: boolean,
+    changedBy: string,
+    notes?: string
+  ): Promise<Toggle | null> {
+    const client = await this.connectClient();
 
     try {
       await client.query('BEGIN');
@@ -383,7 +626,7 @@ export class DatabaseManager {
 
       return toggle;
     } catch (error) {
-      await client.query('ROLLBACK');
+      await client.query('ROLLBACK').catch(() => undefined);
       logger.error(`[DATABASE] [UPDATE] Failed to update toggle '${name}':`, error);
       throw error;
     } finally {
@@ -392,15 +635,23 @@ export class DatabaseManager {
   }
 
   /**
-   * Update toggle metadata
+   * Update toggle metadata (whole transaction retried on transient failures).
    */
   async updateToggleMetadata(
     name: string,
     metadata: Record<string, unknown>,
     changedBy: string = 'system'
   ): Promise<Toggle | null> {
+    return this.withRetry(() => this.updateToggleMetadataOnce(name, metadata, changedBy));
+  }
 
-    const client = await this.pool.connect();
+  private async updateToggleMetadataOnce(
+    name: string,
+    metadata: Record<string, unknown>,
+    changedBy: string
+  ): Promise<Toggle | null> {
+
+    const client = await this.connectClient();
 
     try {
       await client.query('BEGIN');
@@ -437,7 +688,7 @@ export class DatabaseManager {
       await client.query('COMMIT');
       return toggle;
     } catch (error) {
-      await client.query('ROLLBACK');
+      await client.query('ROLLBACK').catch(() => undefined);
       throw error;
     } finally {
       client.release();
@@ -445,11 +696,15 @@ export class DatabaseManager {
   }
 
   /**
-   * Delete a toggle
+   * Delete a toggle (whole transaction retried on transient failures).
    */
   async deleteToggle(name: string, changedBy: string = 'system'): Promise<boolean> {
+    return this.withRetry(() => this.deleteToggleOnce(name, changedBy));
+  }
 
-    const client = await this.pool.connect();
+  private async deleteToggleOnce(name: string, changedBy: string): Promise<boolean> {
+
+    const client = await this.connectClient();
 
     try {
       await client.query('BEGIN');
@@ -480,7 +735,7 @@ export class DatabaseManager {
 
       return true;
     } catch (error) {
-      await client.query('ROLLBACK');
+      await client.query('ROLLBACK').catch(() => undefined);
       logger.error(`[DATABASE] [DELETE] Failed to delete toggle '${name}':`, error);
       throw error;
     } finally {
@@ -557,7 +812,7 @@ export class DatabaseManager {
    * Get audit history for a toggle
    */
   async getToggleHistory(name: string, limit: number = 50): Promise<AuditEntry[]> {
-    const result = await this.pool.query(
+    const result = await this.query(
       `SELECT * FROM audit_log 
              WHERE toggle_name = $1 
              ORDER BY changed_at DESC 
@@ -571,7 +826,7 @@ export class DatabaseManager {
    * Get recent audit entries across all toggles
    */
   async getRecentAuditLog(limit: number = 100): Promise<AuditEntry[]> {
-    const result = await this.pool.query(
+    const result = await this.query(
       `SELECT * FROM audit_log 
              ORDER BY changed_at DESC 
              LIMIT $1`,

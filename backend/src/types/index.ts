@@ -100,6 +100,9 @@ export interface HealthResponse {
         database: {
             healthy: boolean;
             latencyMs: number;
+            /** Resolved probe outcome; `timeout` = probe still in flight. */
+            status?: 'connected' | 'disconnected' | 'timeout';
+            error?: string;
         };
         cache: {
             healthy: boolean;
