@@ -296,7 +296,9 @@ export class DatabaseManager {
       logger.warn('[DATABASE] checked-out client socket error (query will reject)', err);
     });
     return client;
-  }  /** Single query with transient-failure retry. */
+  }
+
+  /** Single query with transient-failure retry. */
   private query(text: string, params?: unknown[]): Promise<QueryResult> {
     return this.withRetry(() => this.pool.query(text, params));
   }
