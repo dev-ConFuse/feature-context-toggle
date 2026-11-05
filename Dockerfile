@@ -11,7 +11,7 @@ WORKDIR /app
 # Copy frontend with its own tsconfig
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
-RUN npm install
+RUN npm install --no-audit --no-fund --fetch-retries=5 --fetch-retry-maxtimeout=120000 --fetch-timeout=600000
 COPY frontend ./
 # The dashboard build is optional (its src/sdk has pre-existing missing-type
 # errors); never block the API image on it.
@@ -38,7 +38,7 @@ COPY database ./database
 # Copy backend directory
 WORKDIR /app/backend
 COPY backend/package*.json ./
-RUN npm install && npm cache clean --force
+RUN npm install --no-audit --no-fund --fetch-retries=5 --fetch-retry-maxtimeout=120000 --fetch-timeout=600000 && npm cache clean --force
 COPY backend ./
 
 # Build TypeScript
