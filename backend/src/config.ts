@@ -113,6 +113,9 @@ export function loadConfig(): Config {
 
     const nodeEnv = getRequired('NODE_ENV');
 
+    console.log('[CONFIG] NODE_ENV:', nodeEnv);
+    console.log('[CONFIG] DATABASE_URL from env:', process.env.DATABASE_URL ? 'SET' : 'NOT SET');
+
     _config = {
         // Server
         port: getInt('FEATURE_TOGGLE_PORT'),
@@ -122,6 +125,7 @@ export function loadConfig(): Config {
         // Database - NeonDB cloud PostgreSQL
         db: (() => {
             const dbUrl = getRequired('DATABASE_URL');
+            console.log('[CONFIG] DATABASE_URL parsed:', dbUrl.substring(0, 50) + '...');
             let host: string;
             let port: number;
             let name: string;

@@ -47,7 +47,7 @@ export class ToggleClient {
             onServiceUnavailable: config.onServiceUnavailable,
         };
 
-        const dbUrl = this.config.databaseUrl || process.env.DATABASE_URL;
+        const dbUrl = this.config.databaseUrl || (typeof process !== 'undefined' ? process.env.DATABASE_URL : undefined);
         if (dbUrl) {
             this.pool = new pg.Pool({
                 connectionString: dbUrl,

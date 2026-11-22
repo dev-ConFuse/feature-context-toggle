@@ -35,11 +35,29 @@ COPY tsconfig.json ./
 # Copy database schema for initialization
 COPY database ./database
 
+# Build arg for DATABASE_URL (used at build time for migrations, runtime uses mounted env)
+ARG DATABASE_URL
+
+# Build arg for DATABASE_URL (used at build time for migrations, runtime uses mounted env)
+ARG DATABASE_URL
+
+# Set DATABASE_URL as environment variable for runtime
+ENV DATABASE_URL=$DATABASE_URL
+
 # Copy backend directory
 WORKDIR /app/backend
 COPY backend/package*.json ./
 RUN npm install --no-audit --no-fund --fetch-retries=5 --fetch-retry-maxtimeout=120000 --fetch-timeout=600000 && npm cache clean --force
 COPY backend ./
+
+# Create root env files for dotenv (loaded by backend at path.resolve(__dirname, '../../.map.env'))
+# This must come AFTER COPY backend to avoid being overwritten
+RUN echo "DATABASE_URL=\"$DATABASE_URL\"" > /app/.map.env && \
+    echo "DATABASE_URL=\"$DATABASE_URL\"" > /app/.secret.env
+
+# Also create env files in backend directory (loaded first by dotenv from process.cwd())
+RUN echo "DATABASE_URL=\"$DATABASE_URL\"" > .map.env && \
+    echo "DATABASE_URL=\"$DATABASE_URL\"" > .secret.env
 
 # Build TypeScript
 RUN npm run build

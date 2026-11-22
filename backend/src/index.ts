@@ -11,32 +11,71 @@ import helmet from 'helmet';
 import path from 'path';
 import { randomUUID } from 'crypto';
 import { fileURLToPath } from 'url';
-import { loadConfig, getConfig } from './config.js';
-import { getDb } from './db/client.js';
-import { cache } from './cache.js';
-import toggleRoutes from './routes/toggles-db.js';
-import type { HealthResponse } from './types/index.js';
 import { logger } from './utils/logger.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Try resolving local .map.env, .secret.env and .env.local from backend dir and root dir
+// The working directory is /app/backend. Root env files are at /app/.map.env and /app/.secret.env.
+// These must be loaded BEFORE config to ensure DATABASE_URL is available for Prisma/pg.
+// Load root env files first (they contain DATABASE_URL), then backend-local ones.
+// Order matters: later calls override earlier ones.
+dotenv.config({ path: '/app/.map.env' });
+dotenv.config({ path: '/app/.secret.env' });
+console.log('[ENV DEBUG] After /app/.secret.env, DATABASE_URL:', process.env.DATABASE_URL ? 'SET (' + process.env.DATABASE_URL.substring(0, 50) + '...)' : 'NOT SET');
 dotenv.config({ path: path.resolve(process.cwd(), '.map.env') });
 dotenv.config({ path: path.resolve(process.cwd(), '.secret.env') });
+console.log('[ENV DEBUG] After cwd/.secret.env, DATABASE_URL:', process.env.DATABASE_URL ? 'SET (' + process.env.DATABASE_URL.substring(0, 50) + '...)' : 'NOT SET');
 dotenv.config({ path: path.resolve(process.cwd(), '.env.local') });
-dotenv.config({ path: path.resolve(__dirname, '../../.map.env') });
-dotenv.config({ path: path.resolve(__dirname, '../../.secret.env') });
-dotenv.config({ path: path.resolve(__dirname, '../../.env.local') });
+// Fallback: also check the parent directory (for different working directories)
+dotenv.config({ path: path.resolve(__dirname, '../.map.env') });
+dotenv.config({ path: path.resolve(__dirname, '../.secret.env') });
+console.log('[ENV DEBUG] After parent .secret.env, DATABASE_URL:', process.env.DATABASE_URL ? 'SET (' + process.env.DATABASE_URL.substring(0, 50) + '...)' : 'NOT SET');
+dotenv.config({ path: path.resolve(__dirname, '../.env.local') });
 
-// Load configuration first (validates required env vars)
+// Load configuration AFTER dotenv (validates required env vars)
 logger.info('[STARTUP] Loading configuration...');
+console.log('[INDEX] Before import config, DATABASE_URL in process.env:', process.env.DATABASE_URL ? 'SET' : 'NOT SET');
+
+// Fallback: if DATABASE_URL is not set, try to read from .secret.env files
+if (!process.env.DATABASE_URL) {
+    const fs = await import('fs');
+    const path = await import('path');
+    const secretPaths = [
+        path.resolve(process.cwd(), '.secret.env'),
+        path.resolve(__dirname, '../../.secret.env'),
+    ];
+    for (const secretPath of secretPaths) {
+        try {
+            const content = fs.readFileSync(secretPath, 'utf-8');
+            const match = content.match(/DATABASE_URL[=\s]+"?([^"\s]+)"?/);
+            if (match) {
+                process.env.DATABASE_URL = match[1];
+                console.log('[INDEX] Loaded DATABASE_URL from', secretPath);
+                break;
+            }
+        } catch (e) {
+            // ignore
+        }
+    }
+}
+console.log('[INDEX] After fallback, DATABASE_URL in process.env:', process.env.DATABASE_URL ? 'SET' : 'NOT SET');
+
+const { loadConfig } = await import('./config.js');
+console.log('[INDEX] After import config, before loadConfig');
 const appConfig = loadConfig();
+console.log('[INDEX] After loadConfig');
 logger.info('[STARTUP] Configuration loaded successfully', { port: appConfig.port, nodeEnv: appConfig.nodeEnv });
 
 const app = express();
 const PORT = appConfig.port;
 const VERSION = process.env.npm_package_version || '1.0.0';
+
+// Load remaining modules that depend on config
+const { getDb } = await import('./db/client.js');
+const { cache } = await import('./cache.js');
+const toggleRoutes = (await import('./routes/toggles-db.js')).default;
+import type { HealthResponse } from './types/index.js';
 
 // =============================================================================
 // Security Middleware

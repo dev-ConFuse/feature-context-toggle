@@ -23,6 +23,30 @@ import { getConfig, type Config } from '../config.js';
 setDefaultResultOrder('ipv4first');
 setDefaultAutoSelectFamily(false);
 
+// Get the DATABASE_URL from environment for direct connection string usage
+const databaseUrl = process.env.DATABASE_URL;
+if (!databaseUrl) {
+  throw new Error('DATABASE_URL environment variable is required');
+}
+
+// Parse the connection string to override sslmode - Prisma Postgres uses sslmode=require
+// but pg treats this as verify-full which requires a CA cert. We need to override to
+// use our explicit SSL config (rejectUnauthorized: false) by removing sslmode from
+// the connection string.
+function parseConnectionString(url: string): { connectionString: string; ssl: any } {
+  const parsed = new URL(url);
+  // Remove sslmode from search params to prevent pg from parsing it
+  parsed.searchParams.delete('sslmode');
+  return {
+    connectionString: parsed.toString(),
+    ssl: {
+      rejectUnauthorized: false,
+    },
+  };
+}
+
+const { connectionString: prismaConnectionString, ssl: prismaSsl } = parseConnectionString(databaseUrl);
+
 // ESM __dirname equivalent
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -162,70 +186,57 @@ function sleep(ms: number): Promise<void> {
 
 export class DatabaseManager {
   private pool: Pool;
-  private config: DatabaseConfig;
+  private schema: string;
   private initialized: boolean = false;
   private isProduction: boolean;
+  private retryAttempts: number;
+  private retryDelayMs: number;
+  private healthTimeoutMs: number;
   /** Last resolved health-probe outcome (see healthCheck). */
   private lastHealth: DbHealthOutcome | null = null;
   /** Shared in-flight probe — health polling must not stampede the pool. */
   private inFlightProbe: Promise<DbHealthOutcome> | null = null;
 
   constructor() {
-
     // Load configuration from environment
     const appConfig = getConfig();
 
-    this.config = {
-      host: appConfig.db.host,
-      port: appConfig.db.port,
-      database: appConfig.db.name,
-      user: appConfig.db.user,
-      password: appConfig.db.password,
-      schema: appConfig.db.schema,
-      connectionTimeoutMs: appConfig.db.connectionTimeoutMs,
-      healthTimeoutMs: appConfig.db.healthTimeoutMs,
-      poolMin: appConfig.db.poolMin,
-      poolMax: appConfig.db.poolMax,
-      poolIdleTimeoutMs: appConfig.db.poolIdleTimeoutMs,
-      keepAliveDelayMs: appConfig.db.keepAliveDelayMs,
-      queryTimeoutMs: appConfig.db.queryTimeoutMs,
-      retryAttempts: appConfig.db.retryAttempts,
-      retryDelayMs: appConfig.db.retryDelayMs,
-    };
-
+    this.schema = appConfig.db.schema;
     this.isProduction = appConfig.isProduction;
+    this.retryAttempts = appConfig.db.retryAttempts;
+    this.retryDelayMs = appConfig.db.retryDelayMs;
+    this.healthTimeoutMs = appConfig.db.healthTimeoutMs;
 
     // Validate schema name to prevent SQL injection
-    if (!ALLOWED_SCHEMAS.includes(this.config.schema)) {
-      throw new Error(`Invalid schema name: ${this.config.schema}. Allowed: ${ALLOWED_SCHEMAS.join(', ')}`);
+    if (!ALLOWED_SCHEMAS.includes(this.schema)) {
+      throw new Error(`Invalid schema name: ${this.schema}. Allowed: ${ALLOWED_SCHEMAS.join(', ')}`);
     }
 
-    // Configure SSL for Prisma Postgres or other cloud databases
-    const sslConfig = appConfig.db.ssl ? { rejectUnauthorized: false } : false;
+    // Use connection string directly for Prisma Postgres compatibility
+    // This ensures SSL parameters from the connection string are properly handled
+    const connectionString = databaseUrl;
 
     this.pool = new Pool({
-      host: this.config.host,
-      port: this.config.port,
-      database: this.config.database,
-      user: this.config.user,
-      password: this.config.password,
+      connectionString: prismaConnectionString,
       // Warm pool: keep >=1 connection open across idle gaps so requests do not
       // pay the 3-21 s container→Neon handshake again after every quiet spell.
       // TCP keepalive probes defeat idle NAT/flow expiry that silently kills
       // parked connections on this path.
-      min: this.config.poolMin,
-      max: this.config.poolMax,
-      idleTimeoutMillis: this.config.poolIdleTimeoutMs,
+      min: appConfig.db.poolMin,
+      max: appConfig.db.poolMax,
+      idleTimeoutMillis: appConfig.db.poolIdleTimeoutMs,
       keepAlive: true,
-      keepAliveInitialDelayMillis: this.config.keepAliveDelayMs,
+      keepAliveInitialDelayMillis: appConfig.db.keepAliveDelayMs,
       // Slow runtime→Neon handshakes need headroom (env-tuned, see config.ts)
-      connectionTimeoutMillis: this.config.connectionTimeoutMs,
+      connectionTimeoutMillis: appConfig.db.connectionTimeoutMs,
       // Query budget: server-side statement_timeout cancels stuck work cleanly;
       // query_timeout is the client-side backstop for silently-dead connections
       // where no server response will ever arrive.
-      statement_timeout: this.config.queryTimeoutMs,
-      query_timeout: this.config.queryTimeoutMs,
-      ssl: sslConfig,
+      statement_timeout: appConfig.db.queryTimeoutMs,
+      query_timeout: appConfig.db.queryTimeoutMs,
+      // Explicit SSL config - rejectUnauthorized: false allows self-signed certs
+      // which is needed for Prisma Postgres pooled connections
+      ssl: prismaSsl,
     });
 
       // Idle/dead pooled clients emit 'error' asynchronously. Without a
@@ -261,7 +272,7 @@ export class DatabaseManager {
    * once.
    */
   private async withRetry<T>(operation: () => Promise<T>): Promise<T> {
-    const maxAttempts = Math.max(1, this.config.retryAttempts);
+    const maxAttempts = Math.max(1, this.retryAttempts);
     let lastError: unknown;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
@@ -272,7 +283,7 @@ export class DatabaseManager {
           throw error;
         }
         logger.warn(`[DATABASE] transient failure, retrying (${attempt}/${maxAttempts})`, error);
-        await sleep(this.config.retryDelayMs * attempt);
+        await sleep(this.retryDelayMs * attempt);
       }
     }
     throw lastError;
@@ -427,7 +438,7 @@ export class DatabaseManager {
           healthy: true,
           status: 'timeout' as const,
         }),
-        this.config.healthTimeoutMs,
+        this.healthTimeoutMs,
       );
     });
 
@@ -451,7 +462,7 @@ export class DatabaseManager {
   async getToggle(name: string): Promise<Toggle | null> {
 
     const result = await this.query(
-      `SELECT * FROM ${this.config.schema}.toggles WHERE name = $1`,
+      `SELECT * FROM ${this.schema}.toggles WHERE name = $1`,
       [name]
     );
     const toggle = result.rows[0] || null;
@@ -464,7 +475,7 @@ export class DatabaseManager {
    */
   async getAllToggles(category?: string, categoryType?: string): Promise<Toggle[]> {
 
-    let query = `SELECT * FROM ${this.config.schema}.toggles`;
+    let query = `SELECT * FROM ${this.schema}.toggles`;
     const params: string[] = [];
     const conditions: string[] = [];
 
@@ -526,7 +537,7 @@ export class DatabaseManager {
 
       // Insert the toggle
       const result = await client.query(
-        `INSERT INTO ${this.config.schema}.toggles (name, enabled, description, category, category_type, metadata)
+        `INSERT INTO ${this.schema}.toggles (name, enabled, description, category, category_type, metadata)
                  VALUES ($1, $2, $3, $4, $5, $6)
                  RETURNING *`,
         [
@@ -588,7 +599,7 @@ export class DatabaseManager {
       await client.query('BEGIN');
 
       // Get current state for audit
-      const current = await client.query(`SELECT * FROM ${this.config.schema}.toggles WHERE name = $1`, [name]);
+      const current = await client.query(`SELECT * FROM ${this.schema}.toggles WHERE name = $1`, [name]);
 
       if (current.rows.length === 0) {
         await client.query('ROLLBACK');
@@ -604,7 +615,7 @@ export class DatabaseManager {
 
       // Update the toggle
       const result = await client.query(
-        `UPDATE ${this.config.schema}.toggles SET enabled = $1, updated_at = CURRENT_TIMESTAMP WHERE name = $2 RETURNING *`,
+        `UPDATE ${this.schema}.toggles SET enabled = $1, updated_at = CURRENT_TIMESTAMP WHERE name = $2 RETURNING *`,
         [enabled, name]
       );
 
@@ -657,7 +668,7 @@ export class DatabaseManager {
       await client.query('BEGIN');
 
       // Get current state for audit
-      const current = await client.query(`SELECT * FROM ${this.config.schema}.toggles WHERE name = $1`, [name]);
+      const current = await client.query(`SELECT * FROM ${this.schema}.toggles WHERE name = $1`, [name]);
 
       if (current.rows.length === 0) {
         await client.query('ROLLBACK');
@@ -668,7 +679,7 @@ export class DatabaseManager {
 
       // Update the metadata
       const result = await client.query(
-        `UPDATE ${this.config.schema}.toggles SET metadata = $1, updated_at = CURRENT_TIMESTAMP WHERE name = $2 RETURNING *`,
+        `UPDATE ${this.schema}.toggles SET metadata = $1, updated_at = CURRENT_TIMESTAMP WHERE name = $2 RETURNING *`,
         [JSON.stringify(metadata), name]
       );
 
@@ -710,7 +721,7 @@ export class DatabaseManager {
       await client.query('BEGIN');
 
       // Get current state for audit
-      const current = await client.query(`SELECT * FROM ${this.config.schema}.toggles WHERE name = $1`, [name]);
+      const current = await client.query(`SELECT * FROM ${this.schema}.toggles WHERE name = $1`, [name]);
 
       if (current.rows.length === 0) {
         await client.query('ROLLBACK');
@@ -720,7 +731,7 @@ export class DatabaseManager {
       const previousToggle = current.rows[0];
 
       // Delete the toggle
-      await client.query(`DELETE FROM ${this.config.schema}.toggles WHERE name = $1`, [name]);
+      await client.query(`DELETE FROM ${this.schema}.toggles WHERE name = $1`, [name]);
 
       // Log the deletion
       await this.logAudit(client, {
@@ -790,7 +801,7 @@ export class DatabaseManager {
     }
   ): Promise<void> {
     await client.query(
-      `INSERT INTO audit_log 
+      `INSERT INTO ${this.schema}.audit_log 
              (toggle_name, action, previous_value, new_value, previous_metadata, new_metadata, changed_by, ip_address, user_agent, notes)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
       [
