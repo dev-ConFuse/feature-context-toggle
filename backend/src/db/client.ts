@@ -200,7 +200,7 @@ export class DatabaseManager {
       throw new Error(`Invalid schema name: ${this.config.schema}. Allowed: ${ALLOWED_SCHEMAS.join(', ')}`);
     }
 
-    // Configure SSL for NeonDB or other cloud databases
+    // Configure SSL for Prisma Postgres or other cloud databases
     const sslConfig = appConfig.db.ssl ? { rejectUnauthorized: false } : false;
 
     this.pool = new Pool({
