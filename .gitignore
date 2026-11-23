@@ -7,8 +7,5 @@ coverage/
 .env.*
 .map.env
 .secret.env
-!.env.example
-!.map.env.example
-!.secret.env.example
 npm-debug.log
 yarn-error.log
