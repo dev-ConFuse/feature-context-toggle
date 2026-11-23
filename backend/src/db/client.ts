@@ -229,11 +229,10 @@ export class DatabaseManager {
       keepAliveInitialDelayMillis: appConfig.db.keepAliveDelayMs,
       // Slow runtime→Neon handshakes need headroom (env-tuned, see config.ts)
       connectionTimeoutMillis: appConfig.db.connectionTimeoutMs,
-      // Query budget: server-side statement_timeout cancels stuck work cleanly;
-      // query_timeout is the client-side backstop for silently-dead connections
-      // where no server response will ever arrive.
-      statement_timeout: appConfig.db.queryTimeoutMs,
-      query_timeout: appConfig.db.queryTimeoutMs,
+      // Note: statement_timeout and query_timeout are NOT set because they are
+      // PostgreSQL-specific settings that don't work with PgBouncer in transaction
+      // pooling mode (which Prisma Postgres uses). The pooled connection will
+      // return an error if these are set.
       // Explicit SSL config - rejectUnauthorized: false allows self-signed certs
       // which is needed for Prisma Postgres pooled connections
       ssl: prismaSsl,
